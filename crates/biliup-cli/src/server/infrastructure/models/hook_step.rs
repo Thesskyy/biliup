@@ -1,6 +1,7 @@
 use crate::server::errors::{AppError, AppResult};
 use error_stack::{ResultExt, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::path::Path;
 use tokio::fs;
@@ -70,6 +71,42 @@ impl HookStep {
             }
             cmd => {
                 // 未知命令，返回错误
+                bail!(AppError::Custom(format!("不支持的命令: {:?}", cmd)));
+            }
+        }
+        Ok(())
+    }
+
+    /// 执行钩子步骤，将元数据（含 bvid/aid/title 等）与视频路径合并为 JSON 后通过 stdin 传入
+    ///
+    /// 对于 Run 类型：stdin 传入形如 `{"bvid":"BVxx","aid":123,"title":"...","videos":["/path/a.mp4"]}` 的 JSON
+    /// 对于 Move/Remove 类型：行为与 `execute` 相同，忽略元数据
+    ///
+    /// # 参数
+    /// * `video_paths` - 视频文件路径列表
+    /// * `meta` - 上传成功后从 B 站 API 返回的元数据（如 bvid、aid、title 等）
+    pub async fn execute_with_meta(&self, video_paths: &[&Path], meta: &Value) -> AppResult<()> {
+        match self {
+            HookStep::Run { run } => {
+                let mut json = meta.clone();
+                if let Some(obj) = json.as_object_mut() {
+                    let videos: Vec<Value> = video_paths
+                        .iter()
+                        .map(|p| Value::String(p.to_string_lossy().to_string()))
+                        .collect();
+                    obj.insert("videos".to_string(), Value::Array(videos));
+                }
+                let json_str =
+                    serde_json::to_string(&json).change_context(AppError::Unknown)?;
+                self.execute_command(run, json_str.as_bytes()).await?;
+            }
+            HookStep::Move { mv } => {
+                self.move_file(video_paths, mv).await?;
+            }
+            HookStep::Remove(cmd) if cmd == "rm" => {
+                HookStep::remove_file(video_paths).await?;
+            }
+            HookStep::Remove(cmd) => {
                 bail!(AppError::Custom(format!("不支持的命令: {:?}", cmd)));
             }
         }
@@ -261,6 +298,29 @@ pub async fn process_video(video_path: &[&Path], processors: &[HookStep]) -> App
     }
 
     info!("Video processing completed");
+    Ok(())
+}
+
+/// 处理所有后处理器步骤，并将 B 站上传元数据（含 bvid/aid/title 等）传递给 Run 类型的钩子
+///
+/// Run 类型的钩子收到的 stdin 为 JSON 格式，包含 API 返回的所有字段以及 `videos` 数组（文件路径列表）
+///
+/// # 参数
+/// * `video_paths` - 视频文件路径列表
+/// * `meta` - 上传成功后从 B 站 API 返回的元数据
+/// * `processors` - 处理器步骤列表
+pub async fn process_video_with_meta(
+    video_paths: &[&Path],
+    meta: &Value,
+    processors: &[HookStep],
+) -> AppResult<()> {
+    info!("Starting video processing with upload meta...");
+
+    for processor in processors {
+        processor.execute_with_meta(video_paths, meta).await?;
+    }
+
+    info!("Video processing with meta completed");
     Ok(())
 }
 
