@@ -1,12 +1,14 @@
 use crate::server::errors::{AppError, AppResult};
 use error_stack::{ResultExt, bail};
+use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::path::Path;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// 钩子步骤枚举：支持多种操作格式
 /// 既支持 key-value 形式（如 {run: "..."}），也支持纯字符串（如 "rm"）
@@ -17,6 +19,9 @@ pub enum HookStep {
     Run { run: String },
     /// 移动文件格式：{mv: "target_dir"}
     Move { mv: String },
+    /// Webhook 推送格式：{webhook: "https://example.com/notify"}
+    /// 上传完成后以 POST 方式将稿件元数据（JSON）发送到指定 URL
+    Webhook { webhook: String },
     /// 删除文件格式："rm"
     Remove(String),
 }
@@ -44,6 +49,15 @@ impl HookStep {
                 // 移动文件到指定目录
                 self.move_file(video_paths, mv).await?;
             }
+            HookStep::Webhook { webhook } => {
+                // 仅携带视频文件路径列表的推送（无上传元数据时）
+                let videos: Vec<Value> = video_paths
+                    .iter()
+                    .map(|p| Value::String(p.to_string_lossy().to_string()))
+                    .collect();
+                let payload = serde_json::json!({ "videos": videos });
+                self.post_webhook(webhook, &payload).await?;
+            }
             HookStep::Remove(cmd) if cmd == "rm" => {
                 // 删除文件
                 HookStep::remove_file(video_paths).await?;
@@ -68,10 +82,92 @@ impl HookStep {
             HookStep::Run { run } => {
                 self.execute_command(run, src).await?;
             }
+            HookStep::Webhook { webhook } => {
+                // 尝试将 src 解析为 JSON；失败时包装成 {"data": "<string>"} 再推送
+                let payload: Value = serde_json::from_slice(src).unwrap_or_else(|_| {
+                    let text = String::from_utf8_lossy(src).to_string();
+                    serde_json::json!({ "data": text })
+                });
+                self.post_webhook(webhook, &payload).await?;
+            }
             cmd => {
                 // 未知命令，返回错误
                 bail!(AppError::Custom(format!("不支持的命令: {:?}", cmd)));
             }
+        }
+        Ok(())
+    }
+
+    /// 执行钩子步骤，将元数据（含 bvid/aid/title 等）与视频路径合并为 JSON 后通过 stdin 传入
+    ///
+    /// 对于 Run 类型：stdin 传入形如 `{"bvid":"BVxx","aid":123,"title":"...","videos":["/path/a.mp4"]}` 的 JSON
+    /// 对于 Webhook 类型：以 POST 方式将同样格式的 JSON 发送到指定 URL
+    /// 对于 Move/Remove 类型：行为与 `execute` 相同，忽略元数据
+    ///
+    /// # 参数
+    /// * `video_paths` - 视频文件路径列表
+    /// * `meta` - 上传成功后从 B 站 API 返回的元数据（如 bvid、aid、title 等）
+    pub async fn execute_with_meta(&self, video_paths: &[&Path], meta: &Value) -> AppResult<()> {
+        match self {
+            HookStep::Run { run } => {
+                let mut json = meta.clone();
+                if let Some(obj) = json.as_object_mut() {
+                    let videos: Vec<Value> = video_paths
+                        .iter()
+                        .map(|p| Value::String(p.to_string_lossy().to_string()))
+                        .collect();
+                    obj.insert("videos".to_string(), Value::Array(videos));
+                }
+                let json_str =
+                    serde_json::to_string(&json).change_context(AppError::Unknown)?;
+                self.execute_command(run, json_str.as_bytes()).await?;
+            }
+            HookStep::Webhook { webhook } => {
+                // 将元数据与视频路径合并后 POST 到指定 URL
+                let mut json = meta.clone();
+                if let Some(obj) = json.as_object_mut() {
+                    let videos: Vec<Value> = video_paths
+                        .iter()
+                        .map(|p| Value::String(p.to_string_lossy().to_string()))
+                        .collect();
+                    obj.insert("videos".to_string(), Value::Array(videos));
+                }
+                self.post_webhook(webhook, &json).await?;
+            }
+            HookStep::Move { mv } => {
+                self.move_file(video_paths, mv).await?;
+            }
+            HookStep::Remove(cmd) if cmd == "rm" => {
+                HookStep::remove_file(video_paths).await?;
+            }
+            HookStep::Remove(cmd) => {
+                bail!(AppError::Custom(format!("不支持的命令: {:?}", cmd)));
+            }
+        }
+        Ok(())
+    }
+
+    /// 以 HTTP POST 方式将 JSON 有效载荷推送到指定 Webhook URL
+    ///
+    /// # 参数
+    /// * `url`     - 目标 Webhook 地址
+    /// * `payload` - 要发送的 JSON 数据
+    async fn post_webhook(&self, url: &str, payload: &Value) -> AppResult<()> {
+        let body = serde_json::to_string(payload).change_context(AppError::Unknown)?;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .change_context(AppError::Unknown)?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            info!(status=%status, response=%text, url=%url, "Webhook 推送成功");
+        } else {
+            warn!(status=%status, response=%text, url=%url, "Webhook 返回非 2xx 状态码");
         }
         Ok(())
     }
@@ -82,7 +178,6 @@ impl HookStep {
     /// * `cmd` - 要执行的命令字符串
     /// * `video_paths` - 视频文件路径列表
     async fn execute_command(&self, cmd: &str, src: &[u8]) -> AppResult<()> {
-        // 1. 跨平台 Shell 处理 (对应 shell=True)
         // Windows 使用 "cmd /C"，Unix/Mac 使用 "sh -c"
         let (shell, flag) = if cfg!(target_os = "windows") {
             ("cmd", "/C")
@@ -261,6 +356,29 @@ pub async fn process_video(video_path: &[&Path], processors: &[HookStep]) -> App
     }
 
     info!("Video processing completed");
+    Ok(())
+}
+
+/// 处理所有后处理器步骤，并将 B 站上传元数据（含 bvid/aid/title 等）传递给 Run 类型的钩子
+///
+/// Run 类型的钩子收到的 stdin 为 JSON 格式，包含 API 返回的所有字段以及 `videos` 数组（文件路径列表）
+///
+/// # 参数
+/// * `video_paths` - 视频文件路径列表
+/// * `meta` - 上传成功后从 B 站 API 返回的元数据
+/// * `processors` - 处理器步骤列表
+pub async fn process_video_with_meta(
+    video_paths: &[&Path],
+    meta: &Value,
+    processors: &[HookStep],
+) -> AppResult<()> {
+    info!("Starting video processing with upload meta...");
+
+    for processor in processors {
+        processor.execute_with_meta(video_paths, meta).await?;
+    }
+
+    info!("Video processing with meta completed");
     Ok(())
 }
 

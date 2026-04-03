@@ -5,7 +5,7 @@ use crate::server::core::downloader::SegmentInfo;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::context::{Context, Stage, Worker, WorkerStatus};
 use crate::server::infrastructure::models::InsertFileItem;
-use crate::server::infrastructure::models::hook_step::process_video;
+use crate::server::infrastructure::models::hook_step::{process_video, process_video_with_meta};
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use async_channel::Receiver;
 use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
@@ -19,6 +19,7 @@ use error_stack::ResultExt;
 use futures::StreamExt;
 use futures::stream::Inspect;
 use ormlite::Insert;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
@@ -70,12 +71,18 @@ where
         )
         .await?;
         let submit_api = ctx.config().submit_api.clone();
-        submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
-    }
+        let response =
+            submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+        let archive_data = response.data;
+        info!(archive=?archive_data, "提交成功，已获取稿件元数据");
 
-    // 4. 执行后处理
-    if !uploaded_videos.paths.is_empty() {
-        execute_postprocessor(uploaded_videos.paths, ctx).await?;
+        // 4. 执行后处理（携带上传元数据，含 bvid/aid/title 等）
+        if !uploaded_videos.paths.is_empty() {
+            execute_postprocessor(uploaded_videos.paths, ctx, archive_data).await?;
+        }
+    } else if !uploaded_videos.paths.is_empty() {
+        // 视频已上传但提交列表为空时仍执行后处理（无元数据）
+        execute_postprocessor(uploaded_videos.paths, ctx, None).await?;
     }
 
     Ok(())
@@ -278,10 +285,17 @@ pub(crate) async fn build_studio(
     Ok(studio)
 }
 
-pub async fn execute_postprocessor(video_paths: Vec<PathBuf>, ctx: &Context) -> AppResult<()> {
+pub async fn execute_postprocessor(
+    video_paths: Vec<PathBuf>,
+    ctx: &Context,
+    archive_data: Option<Value>,
+) -> AppResult<()> {
     if let Some(processor) = &ctx.live_streamer().postprocessor {
         let paths: Vec<&Path> = video_paths.iter().map(|p| p.as_path()).collect();
-        process_video(&paths, processor).await?;
+        match archive_data {
+            Some(meta) => process_video_with_meta(&paths, &meta, processor).await?,
+            None => process_video(&paths, processor).await?,
+        }
     }
     Ok(())
 }
@@ -417,7 +431,7 @@ impl UActor {
                             paths.push(event.prev_file_path);
                         }
                         // 无上传配置时，直接执行后处理
-                        execute_postprocessor(paths, &ctx).await
+                        execute_postprocessor(paths, &ctx, None).await
                     }
                 };
 
